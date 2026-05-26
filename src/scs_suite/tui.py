@@ -1,6 +1,6 @@
-"""Textual-based STS3215 motor debugger.
+"""Textual-based SCSCL motor debugger.
 
-This file hosts the main ``StsApp`` class. Constants + dispatch tables live
+This file hosts the main ``ScsApp`` class. Constants + dispatch tables live
 in :mod:`tui_meta`; modal/full-screen overlays live in :mod:`tui_screens`.
 """
 
@@ -31,7 +31,7 @@ from textual.widgets import (
 )
 
 from . import motor as m
-from .session import Session, open_session
+from .session import Session
 from .tui_meta import (
     BROADCAST_ID,
     EEPROM_BLOCK_LEN,
@@ -39,7 +39,6 @@ from .tui_meta import (
     EEPROM_END_ADDR,
     LOCK_ADDR,
     MODE_POSITION,
-    REG_BY_NAME,
     REGISTERS,
     RegDef,
     SRAM_BLOCK_LEN,
@@ -49,13 +48,15 @@ from .tui_meta import (
     TORQUE_ENABLE_ADDR,
     bytes_to_uint,
     decode_status,
-    int_to_bytes_signed,
-    load_last_port,
+    derive_mode,
     mode_ctrl,
-    save_last_port,
     speed_raw_to_signed,
     speed_signed_to_raw,
+    profile_for_model,
+    reg_by_name_for_model,
+    registers_for_model,
     uint_to_bytes,
+    word_be,
 )
 from .tui_screens import (
     DiffScreen,
@@ -74,8 +75,11 @@ RAW_COL = 1
 class MotorItem(ListItem):
     """Sidebar row. Displays id plus a [*]/[ ] selection marker."""
 
-    def __init__(self, motor_id: int):
-        self._label = Label(f"[ ] id={motor_id}")
+    def __init__(self, motor_id: int, model: str = "scs0009"):
+        self.model = model
+        self._label = Label(
+            f"[ ] id={motor_id} {profile_for_model(model).display_name}"
+        )
         super().__init__(self._label)
         self.motor_id = motor_id
         self.multi_selected = False
@@ -83,10 +87,12 @@ class MotorItem(ListItem):
     def set_selected(self, on: bool) -> None:
         self.multi_selected = on
         mark = "[*]" if on else "[ ]"
-        self._label.update(f"{mark} id={self.motor_id}")
+        self._label.update(
+            f"{mark} id={self.motor_id} {profile_for_model(self.model).display_name}"
+        )
 
 
-class StsApp(App):
+class ScsApp(App):
     CSS = """
     Screen { layout: horizontal; }
 
@@ -140,7 +146,7 @@ class StsApp(App):
         Binding("r", "rescan", "Rescan"),
         Binding("t", "toggle_torque", "Torque"),
         Binding("exclamation_mark", "estop", "E-STOP", priority=True),
-        Binding("space", "refresh_all", "Refresh"),
+        Binding("ctrl+space", "refresh_all", "Refresh"),
         Binding("g", "focus_goal", "Goal"),
         Binding("c", "center", "Center"),
         Binding("k", "nudge(5)", "+5"),
@@ -155,7 +161,7 @@ class StsApp(App):
         Binding("w", "waveform", "Wave"),
         Binding("v", "grid_view", "Grid"),
         Binding("ctrl+r", "reboot", "Reboot"),
-        Binding("ctrl+space", "toggle_motor_selection", "Select", show=False),
+        Binding("space", "toggle_motor_selection", "Select"),
         Binding("question_mark", "help", "Help"),
     ]
 
@@ -183,7 +189,7 @@ class StsApp(App):
                 yield Button("Rescan [r]", id="rescan_btn", variant="primary")
                 yield Static("", id="session_info")
                 yield Static(
-                    "[dim]ctrl+space: toggle multi-select[/dim]",
+                    "[dim]space: toggle multi-select[/dim]",
                     id="sidebar_hint",
                 )
             with Vertical(id="main"):
@@ -193,7 +199,7 @@ class StsApp(App):
                 with Vertical(id="controls"):
                     with Horizontal():
                         yield Label("goal:", id="goal_label")
-                        yield Input(placeholder="0-4095", id="goal_input")
+                        yield Input(placeholder="0-1023", id="goal_input")
                         yield Button("Set", id="set_goal_btn", variant="success")
                         yield Button("Torque [t]", id="torque_btn")
                         yield Button("Reboot", id="reboot_btn", variant="warning")
@@ -202,7 +208,7 @@ class StsApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = "sts-suite"
+        self.title = "scs-suite"
 
         table = self.query_one("#regtable", DataTable)
         table.add_column("register", width=24)
@@ -210,30 +216,20 @@ class StsApp(App):
         table.add_column("addr", width=5)
         table.add_column("len", width=3)
         table.add_column("r/w", width=3)
-        for reg in REGISTERS:
-            table.add_row(
-                reg.name, "-", str(reg.addr), str(reg.length),
-                "RW" if reg.rw else "R",
-            )
+        self._set_register_rows(REGISTERS)
 
         if self.session is None:
             self.push_screen(PortSelectScreen(), self._on_port_picked)
         else:
             self._init_with_session()
 
-    def _on_port_picked(self, result: Optional[tuple[str, int]]) -> None:
-        if result is None:
+    def _on_port_picked(self, session: Optional[Session]) -> None:
+        # The modal opens the bus + scans on a worker thread and only
+        # dismisses with a Session on success, so we just install it.
+        if session is None:
             self.exit()
             return
-        port, baud = result
-        try:
-            self.session = open_session(port=port, baud=baud)
-            self.session.rescan()
-        except Exception as e:  # noqa: BLE001
-            self.notify(f"Failed to open {port}: {e}", severity="error")
-            self.push_screen(PortSelectScreen(), self._on_port_picked)
-            return
-        save_last_port(port, baud)
+        self.session = session
         self._init_with_session()
 
     def _init_with_session(self) -> None:
@@ -248,6 +244,29 @@ class StsApp(App):
 
     # ------------ motor list ------------
 
+    def _model_for(self, sid: Optional[int]) -> str:
+        if sid is None or self.session is None:
+            return "scs0009"
+        return self.session.motor_models.get(sid, "scs0009")
+
+    def registers_for_motor(self, sid: Optional[int]) -> list[RegDef]:
+        return registers_for_model(self._model_for(sid))
+
+    def _reg_by_name(self, sid: Optional[int]) -> dict[str, RegDef]:
+        return reg_by_name_for_model(self._model_for(sid))
+
+    def _set_register_rows(self, registers: list[RegDef]) -> None:
+        table = self.query_one("#regtable", DataTable)
+        table.clear(columns=False)
+        for reg in registers:
+            table.add_row(
+                reg.name,
+                "-",
+                str(reg.addr),
+                str(reg.length),
+                "RW" if reg.rw else "R",
+            )
+
     def _rebuild_motor_list(self, preferred_id: Optional[int] = None) -> None:
         if self.session is None:
             return
@@ -255,7 +274,7 @@ class StsApp(App):
         lst.clear()
         self._multi_selected.clear()
         for sid in self.session.ids:
-            lst.append(MotorItem(sid))
+            lst.append(MotorItem(sid, self._model_for(sid)))
         if self.session.ids:
             if preferred_id is not None and preferred_id in self.session.ids:
                 target = preferred_id
@@ -263,6 +282,7 @@ class StsApp(App):
                 target = self.session.ids[0]
             self.selected_id = target
             lst.index = self.session.ids.index(target)
+            self._set_register_rows(self.registers_for_motor(target))
             self._refresh_all()
         else:
             self.selected_id = None
@@ -274,6 +294,7 @@ class StsApp(App):
     def _on_motor_highlighted(self, event: ListView.Highlighted) -> None:
         if isinstance(event.item, MotorItem):
             self.selected_id = event.item.motor_id
+            self._set_register_rows(self.registers_for_motor(self.selected_id))
             self._refresh_all()
             self._status(f"Selected motor {self.selected_id}")
 
@@ -345,7 +366,7 @@ class StsApp(App):
     def _apply_live_block(self, sid: int, block: Optional[bytes]) -> None:
         if sid != self.selected_id:
             return
-        for row, reg in enumerate(REGISTERS):
+        for row, reg in enumerate(self.registers_for_motor(sid)):
             if not reg.live:
                 continue
             val: Optional[int] = None
@@ -355,31 +376,37 @@ class StsApp(App):
                 and reg.addr + reg.length - SRAM_BLOCK_START <= len(block)
             ):
                 offset = reg.addr - SRAM_BLOCK_START
-                val = int.from_bytes(
-                    block[offset:offset + reg.length], "little", signed=False
-                )
+                val = bytes_to_uint(block[offset : offset + reg.length])
             self._update_row(row, reg, val)
         if block is not None:
             self._update_watch_strip(block)
 
     def _update_watch_strip(self, block: bytes) -> None:
         # block starts at addr 40
-        def u16(off: int) -> int: return int.from_bytes(block[off:off+2], "little", signed=False)
+        def u16(off: int) -> int:
+            return word_be(block, off)
+
         try:
-            torque = block[0]              # 40
-            goal = u16(2)                  # 42
-            pos = u16(16)                  # 56
-            spd = speed_raw_to_signed(u16(18))   # 58
+            torque = block[0]  # 40
+            goal = u16(2)  # 42
+            pos = u16(16)  # 56
+            spd = speed_raw_to_signed(u16(18))  # 58
             load = speed_raw_to_signed(u16(20))  # 60
-            volt = block[22]               # 62
-            temp = block[23]               # 63
-            status = block[STATUS_ADDR - SRAM_BLOCK_START] if (STATUS_ADDR - SRAM_BLOCK_START) < len(block) else 0
-            moving = block[26]             # 66
+            volt = block[22]  # 62
+            temp = block[23]  # 63
+            status = (
+                block[STATUS_ADDR - SRAM_BLOCK_START]
+                if (STATUS_ADDR - SRAM_BLOCK_START) < len(block)
+                else 0
+            )
+            moving = block[26]  # 66
         except Exception:
             return
         status_tags, _ = decode_status(status)
         status_str = (
-            f"[red]{'|'.join(status_tags)}[/red]" if status_tags else "[green]ok[/green]"
+            f"[red]{'|'.join(status_tags)}[/red]"
+            if status_tags
+            else "[green]ok[/green]"
         )
         torque_str = "[green]ON[/green]" if torque else "[red]OFF[/red]"
         mov_str = "[cyan]MOV[/cyan]" if moving else "   "
@@ -417,27 +444,26 @@ class StsApp(App):
             if reg.addr <= EEPROM_END_ADDR and eeprom is not None:
                 off = reg.addr - EEPROM_BLOCK_START
                 if off + reg.length <= len(eeprom):
-                    return int.from_bytes(
-                        eeprom[off:off + reg.length], "little", signed=False
-                    )
+                    return bytes_to_uint(eeprom[off : off + reg.length])
             elif reg.addr >= SRAM_BLOCK_START and sram is not None:
                 off = reg.addr - SRAM_BLOCK_START
                 if off + reg.length <= len(sram):
-                    return int.from_bytes(
-                        sram[off:off + reg.length], "little", signed=False
-                    )
+                    return bytes_to_uint(sram[off : off + reg.length])
             return None
 
-        new_mode: Optional[int] = None
-        for row, reg in enumerate(REGISTERS):
+        min_angle: Optional[int] = None
+        max_angle: Optional[int] = None
+        for row, reg in enumerate(self.registers_for_motor(sid)):
             val = _from_block(reg)
             if val is None:
                 val = self._read_reg(sid, reg.addr, reg.length)
             self._update_row(row, reg, val)
-            if reg.name == "mode" and val is not None:
-                new_mode = val
-        if new_mode is not None:
-            self.mode = new_mode
+            if reg.name == "min_angle_limit" and val is not None:
+                min_angle = val
+            elif reg.name == "max_angle_limit" and val is not None:
+                max_angle = val
+        if min_angle is not None and max_angle is not None:
+            self.mode = derive_mode(min_angle, max_angle)
         self._update_title()
         if sram is not None:
             self._update_watch_strip(sram)
@@ -449,7 +475,11 @@ class StsApp(App):
             return "err"
         if reg.name == "status":
             tags, _ = decode_status(raw_value)
-            return f"{raw_value}  [red]{'|'.join(tags)}[/red]" if tags else f"{raw_value}  ok"
+            return (
+                f"{raw_value}  [red]{'|'.join(tags)}[/red]"
+                if tags
+                else f"{raw_value}  ok"
+            )
         if reg.options and raw_value in reg.options:
             short = reg.options[raw_value].split(":", 1)[-1].strip()
             return f"{raw_value}  ({short})"
@@ -457,7 +487,9 @@ class StsApp(App):
             return f"{raw_value} = {speed_raw_to_signed(raw_value):+d}"
         return str(raw_value)
 
-    def _update_row(self, row_index: int, reg: RegDef, raw_value: Optional[int]) -> None:
+    def _update_row(
+        self, row_index: int, reg: RegDef, raw_value: Optional[int]
+    ) -> None:
         table = self.query_one("#regtable", DataTable)
         try:
             table.update_cell_at(
@@ -475,8 +507,10 @@ class StsApp(App):
         if sid is None:
             title.update("No motor selected")
             return
+        profile = profile_for_model(self._model_for(sid))
         title.update(
-            f"Registers for motor id={sid}  -  [b]{mode_ctrl(self.mode).pretty_name}[/b]"
+            f"Registers for {profile.display_name} id={sid}  -  "
+            f"[b]{mode_ctrl(self.mode).pretty_name}[/b]"
         )
 
     def watch_mode(self, new_mode: int) -> None:
@@ -513,22 +547,19 @@ class StsApp(App):
         if not targets:
             return (mc.label.rstrip(":"), v, [])
         bus = self.session.bus
+        reg_by_name = self._reg_by_name(self.selected_id)
 
         if mc.target == "position":
-            reg = REG_BY_NAME["goal_position"]
-            if mc.signed:
-                data = int_to_bytes_signed(v, reg.length)
-            else:
-                data = uint_to_bytes(v, reg.length)
+            reg = reg_by_name["goal_position"]
+            data = uint_to_bytes(v, reg.length)
             if len(targets) == 1:
                 sid = targets[0]
-                # Keep acceleration/goal_time sane for plain position mode.
-                if self.mode == MODE_POSITION:
-                    try:
-                        bus.write_acceleration(sid, 30)
-                        bus.write_goal_time(sid, 0)
-                    except Exception:
-                        pass
+                try:
+                    bus.write_raw_data(
+                        sid, reg_by_name["goal_time"].addr, uint_to_bytes(0, 2)
+                    )
+                except Exception:
+                    pass
                 bus.write_raw_data(sid, reg.addr, data)
             else:
                 bus.sync_write_raw_data(targets, reg.addr, [data] * len(targets))
@@ -536,17 +567,17 @@ class StsApp(App):
             raw = speed_signed_to_raw(v) if mc.signed else v
             data = uint_to_bytes(raw, 2)
             if len(targets) == 1:
-                bus.write_raw_goal_speed(targets[0], raw)
+                bus.write_raw_data(targets[0], reg_by_name["goal_speed"].addr, data)
             else:
                 bus.sync_write_raw_data(
-                    targets, REG_BY_NAME["goal_speed"].addr, [data] * len(targets)
+                    targets, reg_by_name["goal_speed"].addr, [data] * len(targets)
                 )
         return (mc.label.rstrip(":"), v, targets)
 
     def _write_reg(self, sid: int, reg: RegDef, value: int) -> None:
         """Write a register, tolerating bus-timeout false negatives.
 
-        The STS3215's EEPROM cells take 3-5 ms to program and USB-to-serial
+        SCSCL EEPROM cells take a few ms to program and USB-to-serial
         adapters add their own latency, so a "timeout" on write often means
         the write succeeded but the status packet was late. We verify by
         read-back (or rescan for ``id``) before reporting failure.
@@ -554,7 +585,8 @@ class StsApp(App):
         if self.session is None:
             return
         eeprom = reg.addr <= EEPROM_END_ADDR
-        data = uint_to_bytes(value, reg.length)
+        raw_value = speed_signed_to_raw(value) if reg.name == "goal_speed" else value
+        data = uint_to_bytes(raw_value, reg.length)
         bus = self.session.bus
 
         # Best-effort unlock for EEPROM. If this itself times out the real
@@ -592,7 +624,8 @@ class StsApp(App):
                 except Exception:
                     pass
             self._status(
-                f"Write failed for {reg.name}" + (f": {write_err}" if write_err else ""),
+                f"Write failed for {reg.name}"
+                + (f": {write_err}" if write_err else ""),
                 error=True,
             )
             return
@@ -643,12 +676,16 @@ class StsApp(App):
         if sid is None or self.session is None:
             return
         try:
-            cur = m._first(self.session.bus.read_raw_torque_enable(sid))
+            cur = bytes_to_uint(
+                self.session.bus.read_raw_data(sid, TORQUE_ENABLE_ADDR, 1)
+            )
             new = not bool(cur)
             targets = self._targets()
             if len(targets) > 1:
                 self.session.bus.sync_write_raw_data(
-                    targets, TORQUE_ENABLE_ADDR, [[1 if new else 0]] * len(targets),
+                    targets,
+                    TORQUE_ENABLE_ADDR,
+                    [[1 if new else 0]] * len(targets),
                 )
                 self._status(f"Torque {'ON' if new else 'OFF'} on {targets}")
             else:
@@ -681,17 +718,19 @@ class StsApp(App):
         try:
             sid = self.selected_id  # use cursor motor as the reference for nudge math
             if mc.target == "speed":
-                cur_raw = m._first(self.session.bus.read_raw_goal_speed(sid))
-                signed = speed_raw_to_signed(int(cur_raw)) if mc.signed else int(cur_raw)
-                new_val = max(mc.min_val, min(mc.max_val, signed + base * mc.nudge_scale))
+                cur_raw = bytes_to_uint(
+                    self.session.bus.read_raw_data(
+                        sid, self._reg_by_name(sid)["goal_speed"].addr, 2
+                    )
+                )
+                signed = (
+                    speed_raw_to_signed(int(cur_raw)) if mc.signed else int(cur_raw)
+                )
+                new_val = max(
+                    mc.min_val, min(mc.max_val, signed + base * mc.nudge_scale)
+                )
             else:
-                if self.mode == MODE_POSITION:
-                    cur = m.read_present_position(self.session.bus, sid)
-                else:
-                    raw = int(m._first(self.session.bus.read_raw_goal_position(sid)))
-                    cur = int.from_bytes(
-                        raw.to_bytes(2, "little", signed=False), "little", signed=True
-                    ) if mc.signed else raw
+                cur = m.read_present_position(self.session.bus, sid)
                 new_val = max(mc.min_val, min(mc.max_val, cur + base * mc.nudge_scale))
 
             kind, v, targets = self._apply_target(new_val)
@@ -710,7 +749,7 @@ class StsApp(App):
             if mc.target == "speed":
                 kind, v, _ = self._apply_target(0)
             else:
-                center = 2048 if not mc.signed else 0
+                center = m.POSITION_CENTER if not mc.signed else 0
                 kind, v, _ = self._apply_target(center)
             self._status(f"Center: {kind} -> {v}")
         except Exception as e:  # noqa: BLE001
@@ -761,8 +800,9 @@ class StsApp(App):
 
     def _apply_preset(self, sid: int, regs: dict[str, int]) -> int:
         count = 0
+        reg_by_name = self._reg_by_name(sid)
         for name, value in regs.items():
-            reg = REG_BY_NAME.get(name)
+            reg = reg_by_name.get(name)
             if reg is None or not reg.rw:
                 continue
             self._write_reg(sid, reg, int(value))
@@ -779,9 +819,10 @@ class StsApp(App):
         if self.selected_id is None or self.session is None:
             self._status("Select a motor first", error=True)
             return
-        if not (0 <= row_idx < len(REGISTERS)):
+        registers = self.registers_for_motor(self.selected_id)
+        if not (0 <= row_idx < len(registers)):
             return
-        reg = REGISTERS[row_idx]
+        reg = registers[row_idx]
         if not reg.rw:
             self._status(f"{reg.name} is read-only", error=True)
             return
@@ -811,26 +852,22 @@ class StsApp(App):
         for sid in self.session.ids:
             eeprom = self._read_block(sid, EEPROM_BLOCK_START, EEPROM_BLOCK_LEN)
             sram = self._read_block(sid, SRAM_BLOCK_START, SRAM_BLOCK_LEN)
-            regs: dict = {}
-            for reg in REGISTERS:
+            regs: dict = {"model": self._model_for(sid)}
+            for reg in self.registers_for_motor(sid):
                 if reg.addr <= EEPROM_END_ADDR and eeprom is not None:
                     off = reg.addr
                     if off + reg.length <= len(eeprom):
-                        regs[reg.name] = int.from_bytes(
-                            eeprom[off:off + reg.length], "little", signed=False
-                        )
+                        regs[reg.name] = bytes_to_uint(eeprom[off : off + reg.length])
                         continue
                 if reg.addr >= SRAM_BLOCK_START and sram is not None:
                     off = reg.addr - SRAM_BLOCK_START
                     if off + reg.length <= len(sram):
-                        regs[reg.name] = int.from_bytes(
-                            sram[off:off + reg.length], "little", signed=False
-                        )
+                        regs[reg.name] = bytes_to_uint(sram[off : off + reg.length])
                         continue
                 regs[reg.name] = self._read_reg(sid, reg.addr, reg.length)
             payload["motors"][str(sid)] = regs
 
-        path = Path.cwd() / f"sts-state-{ts}.json"
+        path = Path.cwd() / f"scs-state-{ts}.json"
         try:
             path.write_text(json.dumps(payload, indent=2))
         except Exception as e:  # noqa: BLE001
@@ -843,8 +880,9 @@ class StsApp(App):
             self._status("Select a motor first", error=True)
             return
         if self.mode != MODE_POSITION:
-            self._status("Movement test is for position mode - switch mode first",
-                         error=True)
+            self._status(
+                "Movement test is for position mode - switch mode first", error=True
+            )
             return
         self._status(f"Testing motor {self.selected_id}...")
         self._run_motor_test(self.selected_id)
@@ -853,11 +891,13 @@ class StsApp(App):
     def _run_motor_test(self, sid: int) -> None:
         if self.session is None:
             return
-        delta = 500
+        delta = 150
         bus = self.session.bus
         try:
             start = m.read_present_position(bus, sid)
-            torque_was = bool(m._first(bus.read_raw_torque_enable(sid)))
+            torque_was = bool(
+                bytes_to_uint(bus.read_raw_data(sid, TORQUE_ENABLE_ADDR, 1))
+            )
 
             target = max(m.POSITION_MIN, min(m.POSITION_MAX, start + delta))
             if target == start:
@@ -874,7 +914,7 @@ class StsApp(App):
 
             m.set_torque(bus, sid, torque_was)
 
-            tol = 30
+            tol = 10
             ok = abs(reached - target) <= tol and abs(returned - start) <= tol
             msg = (
                 f"Test {sid}: {'PASS' if ok else 'FAIL'} "
@@ -932,7 +972,7 @@ class StsApp(App):
 
 
 def run(session: Optional[Session] = None) -> None:
-    app = StsApp(session=session)
+    app = ScsApp(session=session)
     try:
         app.run()
     finally:

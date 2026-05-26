@@ -1,16 +1,19 @@
 [project]
-name = "sts-suite"
-description = "Terminal debugger for Feetech STS3215 smart serial bus servos"
+name = "scs-suite"
+description = "Terminal debugger for Feetech SCS0009 and SCS0043 smart serial bus servos"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     { name = "Binh Pham", email = "binh.pham@livekit.io" },
+    { name = "Victor Oldensand", email = "victormag24@gmail.com" },
 ]
 keywords = [
     "feetech",
-    "sts3215",
+    "scs0009",
+    "scs0043",
+    "scscl",
     "servo",
     "robotics",
     "serial",
@@ -39,36 +42,44 @@ dependencies = [
     "rich>=13.7.0",
     "questionary>=2.0.1",
     "pyserial>=3.5",
-    "rustypot>=1.4.2",
+    "rustypot @ git+https://github.com/jurmy24/rustypot@main",
     "textual>=0.50.0",
     "textual-plotext>=0.2.1",
 ]
 
 [project.urls]
-Homepage = "https://github.com/pham-tuan-binh/sts-suite"
-Repository = "https://github.com/pham-tuan-binh/sts-suite"
-Issues = "https://github.com/pham-tuan-binh/sts-suite/issues"
+Homepage = "https://github.com/jurmy24/scs-suite"
+Repository = "https://github.com/jurmy24/scs-suite"
+Issues = "https://github.com/jurmy24/scs-suite/issues"
 
 [project.scripts]
-sts = "sts_suite.cli:main"
+scs = "scs_suite.cli:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.version]
 source = "vcs"
 
 [tool.hatch.build.hooks.vcs]
-version-file = "src/sts_suite/_version.py"
+version-file = "src/scs_suite/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/sts_suite"]
+packages = ["src/scs_suite"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/sts_suite",
+    "src/scs_suite",
     "README.md",
     "LICENSE",
     "docs/screenshot.png",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "maturin>=1.13.3",
 ]

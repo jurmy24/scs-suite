@@ -33,14 +33,13 @@ from textual.widgets import (
 from textual_plotext import PlotextPlot
 
 from .port_select import list_serial_ports
-from .session import open_session
+from .session import Session, open_session
 from .tui_meta import (
     BAUD_OPTIONS,
     EEPROM_END_ADDR,
     GOAL_POSITION_ADDR,
     GOAL_SPEED_ADDR,
     MODE_POSITION,
-    MODE_WHEEL,
     PRESENT_CURRENT_ADDR,
     PRESENT_LOAD_ADDR,
     PRESENT_POSITION_ADDR,
@@ -48,11 +47,14 @@ from .tui_meta import (
     REG_BY_NAME,
     REGISTERS,
     RegDef,
+    bytes_to_uint,
     load_last_port,
     mode_ctrl,
+    save_last_port,
     speed_raw_to_signed,
     speed_signed_to_raw,
     uint_to_bytes,
+    word_be,
 )
 
 
@@ -73,7 +75,7 @@ class BaudItem(ListItem):
         self.baud = baud
 
 
-class PortSelectScreen(ModalScreen[Optional[tuple[str, int]]]):
+class PortSelectScreen(ModalScreen[Optional[Session]]):
     CSS = """
     PortSelectScreen { align: center middle; }
     #ps_box {
@@ -88,6 +90,9 @@ class PortSelectScreen(ModalScreen[Optional[tuple[str, int]]]):
         height: 8;
         border: solid $accent;
     }
+    #ps_max_motors { width: 16; }
+    #ps_max_row { height: auto; margin-top: 1; }
+    #ps_max_row Label { padding: 0 1 0 0; }
     #ps_buttons { height: auto; margin-top: 1; }
     #ps_status { color: $text-muted; margin-top: 1; }
     """
@@ -97,13 +102,26 @@ class PortSelectScreen(ModalScreen[Optional[tuple[str, int]]]):
         Binding("ctrl+o", "open", "Open"),
     ]
 
+    # Single-char braille spinner; "minimalistic and simple".
+    _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._opening = False
+        self._spinner_idx = 0
+        self._spinner_timer = None
+        self._scan_sid = 0
+
     def compose(self) -> ComposeResult:
         with Vertical(id="ps_box"):
-            yield Label("[b]sts-suite[/b] - open a serial port")
+            yield Label("[b]scs-suite[/b] - open a serial port")
             yield Label("PORT", classes="section")
             yield ListView(id="ps_port_list")
             yield Label("BAUD", classes="section")
             yield ListView(id="ps_baud_list")
+            with Horizontal(id="ps_max_row"):
+                yield Label("MAX MOTORS (blank = scan all):")
+                yield Input(placeholder="e.g. 6", id="ps_max_motors")
             with Horizontal(id="ps_buttons"):
                 yield Button("Open", id="ps_open_btn", variant="primary")
                 yield Button("Baud sweep", id="ps_sweep_btn")
@@ -143,6 +161,8 @@ class PortSelectScreen(ModalScreen[Optional[tuple[str, int]]]):
         self.query_one("#ps_status", Static).update(f"[dim]{msg}[/dim]")
 
     def action_cancel(self) -> None:
+        if self._opening:
+            return
         self.dismiss(None)
 
     def action_open(self) -> None:
@@ -154,15 +174,21 @@ class PortSelectScreen(ModalScreen[Optional[tuple[str, int]]]):
 
     @on(Button.Pressed, "#ps_cancel_btn")
     def _btn_cancel(self) -> None:
+        if self._opening:
+            return
         self.dismiss(None)
 
     @on(Button.Pressed, "#ps_refresh_btn")
     def _btn_refresh(self) -> None:
+        if self._opening:
+            return
         self._populate_ports()
         self._set_status("Port list refreshed")
 
     @on(Button.Pressed, "#ps_sweep_btn")
     def _btn_sweep(self) -> None:
+        if self._opening:
+            return
         port_item = self.query_one("#ps_port_list", ListView).highlighted_child
         if not isinstance(port_item, PortItem):
             self._set_status("Select a port first")
@@ -209,11 +235,13 @@ class PortSelectScreen(ModalScreen[Optional[tuple[str, int]]]):
     def _port_selected(self, _event: ListView.Selected) -> None:
         self.query_one("#ps_baud_list", ListView).focus()
 
-    @on(ListView.Selected, "#ps_baud_list")
-    def _baud_selected(self, _event: ListView.Selected) -> None:
+    @on(Input.Submitted, "#ps_max_motors")
+    def _max_motors_submit(self, _event: Input.Submitted) -> None:
         self._try_open()
 
     def _try_open(self) -> None:
+        if self._opening:
+            return
         port_item = self.query_one("#ps_port_list", ListView).highlighted_child
         baud_item = self.query_one("#ps_baud_list", ListView).highlighted_child
         if not isinstance(port_item, PortItem):
@@ -222,7 +250,76 @@ class PortSelectScreen(ModalScreen[Optional[tuple[str, int]]]):
         if not isinstance(baud_item, BaudItem):
             self._set_status("Select a baud rate")
             return
-        self.dismiss((port_item.device, baud_item.baud))
+        raw = self.query_one("#ps_max_motors", Input).value.strip()
+        max_motors: Optional[int] = None
+        if raw:
+            try:
+                max_motors = int(raw)
+            except ValueError:
+                self._set_status("Max motors must be a positive integer")
+                return
+            if max_motors < 1:
+                self._set_status("Max motors must be a positive integer")
+                return
+        self._begin_opening()
+        self._open_worker(port_item.device, baud_item.baud, max_motors)
+
+    # --- spinner + worker plumbing ---
+
+    def _begin_opening(self) -> None:
+        self._opening = True
+        for btn_id in ("ps_open_btn", "ps_sweep_btn", "ps_refresh_btn"):
+            self.query_one(f"#{btn_id}", Button).disabled = True
+        self._scan_sid = 0
+        self._spinner_idx = 0
+        self._spinner_timer = self.set_interval(0.08, self._tick_spinner)
+        self._tick_spinner()
+
+    def _end_opening(self) -> None:
+        self._opening = False
+        if self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+        for btn_id in ("ps_open_btn", "ps_sweep_btn", "ps_refresh_btn"):
+            self.query_one(f"#{btn_id}", Button).disabled = False
+
+    def _tick_spinner(self) -> None:
+        frame = self._SPINNER_FRAMES[self._spinner_idx % len(self._SPINNER_FRAMES)]
+        self._spinner_idx += 1
+        if self._scan_sid:
+            tail = f"scanning bus  (id {self._scan_sid:>3})"
+        else:
+            tail = "opening port..."
+        self.query_one("#ps_status", Static).update(f"{frame}  {tail}")
+
+    @work(thread=True, exclusive=True, group="open_session")
+    def _open_worker(
+        self, port: str, baud: int, max_motors: Optional[int]
+    ) -> None:
+        # Runs off the UI thread; only mutate widgets via call_from_thread.
+        def progress(sid: int) -> None:
+            self._scan_sid = sid
+
+        try:
+            session = open_session(
+                port=port,
+                baud=baud,
+                max_motors=max_motors,
+                progress_callback=progress,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.app.call_from_thread(self._on_open_failed, str(e))
+            return
+        self.app.call_from_thread(self._on_open_succeeded, session)
+
+    def _on_open_failed(self, msg: str) -> None:
+        self._end_opening()
+        self.query_one("#ps_status", Static).update(f"[red]Failed: {msg}[/red]")
+
+    def _on_open_succeeded(self, session: Session) -> None:
+        self._end_opening()
+        save_last_port(session.port, session.baud)
+        self.dismiss(session)
 
 
 # ============================================================================
@@ -342,7 +439,7 @@ class EditRegScreen(ModalScreen[Optional[int]]):
 
 
 HELP_TEXT = """\
-[b]sts-suite motor debugger[/b]
+[b]scs-suite motor debugger[/b]
 
 [b]Navigation[/b]
   arrow        navigate register table
@@ -353,15 +450,15 @@ HELP_TEXT = """\
   g            focus goal / speed input
   k / j        nudge +5 / -5 (auto-scales per mode)
   l / h        nudge +50 / -50
-  c            center: goal -> 2048 or speed -> 0
+  c            center: goal -> 512 or speed -> 0
   t            toggle torque on selected
   !            E-STOP: disable torque on ALL motors (broadcast)
   Ctrl+R       reboot selected motor
 
 [b]Bus[/b]
   r            rescan bus
-  space        refresh all registers
-  space (sel)  select a motor (sidebar)
+  ctrl+space   refresh all registers
+  space (sel)  toggle multi-select on the sidebar motor
   s            save JSON snapshot
   Ctrl+L       load JSON preset onto selected motor
   d            diff against a saved snapshot
@@ -373,10 +470,8 @@ HELP_TEXT = """\
   v            grid view (all motors at a glance)
 
 [b]Modes[/b]
-  0 position   goal_position, 0..4095
-  1 wheel      goal_speed, -4000..4000 signed
-  2 PWM        goal_speed, -1000..1000 signed
-  3 step       goal_position, signed i16
+  position     goal_position, 0..1023
+  wheel        goal_speed, -1023..1023 signed
 
 [b]App[/b]
   ?            show this help
@@ -496,11 +591,11 @@ class OscilloscopeScreen(Screen):
             return
         if len(buf) < 15:
             return
-        pos = int.from_bytes(buf[0:2], "little", signed=False)
-        spd_raw = int.from_bytes(buf[2:4], "little", signed=False)
-        load_raw = int.from_bytes(buf[4:6], "little", signed=False)
+        pos = word_be(buf, 0)
+        spd_raw = word_be(buf, 2)
+        load_raw = word_be(buf, 4)
         # buf[6]=volt, buf[7]=temp, buf[8]=status, buf[9]=moving, buf[10..12]=reserved
-        cur = int.from_bytes(buf[13:15], "little", signed=False)
+        cur = word_be(buf, 13)
 
         t = time.monotonic() - self._t0
         self._t.append(t)
@@ -558,8 +653,8 @@ class WaveformScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         mc = mode_ctrl(self.mode)
-        default_center = str(2048 if self.mode == MODE_POSITION else 0)
-        default_amp = str(500 if self.mode == MODE_POSITION else 200)
+        default_center = str(512 if self.mode == MODE_POSITION else 0)
+        default_amp = str(100 if self.mode == MODE_POSITION else 50)
         default_hz = "0.5"
         target = "goal_position" if mc.target == "position" else "goal_speed"
         with Vertical(id="wf_box"):
@@ -647,14 +742,15 @@ class WaveformScreen(ModalScreen[None]):
             try:
                 if mc.target == "position":
                     reg = REG_BY_NAME["goal_position"]
-                    if mc.signed:
-                        data = list(int(v).to_bytes(reg.length, "little", signed=True))
-                    else:
-                        data = uint_to_bytes(v, reg.length)
+                    data = uint_to_bytes(v, reg.length)
                     session.bus.write_raw_data(self.motor_id, reg.addr, data)
                 else:
                     raw = speed_signed_to_raw(v) if mc.signed else v
-                    session.bus.write_raw_goal_speed(self.motor_id, raw)
+                    session.bus.write_raw_data(
+                        self.motor_id,
+                        REG_BY_NAME["goal_speed"].addr,
+                        uint_to_bytes(raw, 2),
+                    )
             except Exception:
                 pass
             time.sleep(dt)
@@ -731,7 +827,7 @@ class GridScreen(Screen):
             if block is None:
                 t.add_row(str(sid), "?", "err", "-", "-", "-", "-", "-", "-", "-")
                 continue
-            def u16(off: int) -> int: return int.from_bytes(block[off:off+2], "little", signed=False)
+            def u16(off: int) -> int: return word_be(block, off)
             torque = block[0]
             goal = u16(2)                       # addr 42
             pos = u16(16)                       # addr 56
@@ -786,11 +882,11 @@ class DiffScreen(ModalScreen[None]):
         with Vertical(id="diff_box"):
             yield Label("[b]Diff against saved snapshot[/b]")
             yield Static(
-                "Pick the latest sts-state-*.json in the current dir or type a path.",
+                "Pick the latest scs-state-*.json in the current dir or type a path.",
                 id="diff_hint",
             )
             default = ""
-            files = sorted(Path.cwd().glob("sts-state-*.json"))
+            files = sorted(Path.cwd().glob("scs-state-*.json"))
             if files:
                 default = str(files[-1])
             yield Input(id="diff_input", placeholder="path to snapshot JSON", value=default)
@@ -843,11 +939,17 @@ class DiffScreen(ModalScreen[None]):
                 sid = int(sid_str)
             except ValueError:
                 continue
-            for reg in REGISTERS:
+            registers_for_motor = getattr(self._app, "registers_for_motor", None)
+            registers = (
+                registers_for_motor(sid)
+                if callable(registers_for_motor)
+                else REGISTERS
+            )
+            for reg in registers:
                 saved = saved_regs.get(reg.name)
                 try:
                     raw = session.bus.read_raw_data(sid, reg.addr, reg.length)
-                    current = int.from_bytes(bytes(raw), "little", signed=False)
+                    current = bytes_to_uint(bytes(raw))
                 except Exception:
                     current = None
                 if saved is None or current is None:
@@ -872,7 +974,7 @@ class DiffScreen(ModalScreen[None]):
 class PresetScreen(ModalScreen[None]):
     """Load a JSON preset and apply its fields to the selected motor.
 
-    Preset format: {"registers": {"p_coefficient": 32, "torque_limit": 800, ...}}
+    Preset format: {"registers": {"p_coefficient": 32, "max_torque_limit": 800, ...}}
     """
 
     CSS = """
@@ -898,7 +1000,7 @@ class PresetScreen(ModalScreen[None]):
         with Vertical(id="preset_box"):
             yield Label("[b]Load preset[/b]  (applies to selected motor)")
             yield Static(
-                'JSON: { "registers": { "p_coefficient": 32, "torque_limit": 800 } }',
+                'JSON: { "registers": { "p_coefficient": 32, "max_torque_limit": 800 } }',
                 id="preset_hint",
             )
             yield Input(id="preset_input", placeholder="path to preset JSON")
